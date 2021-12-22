@@ -105,47 +105,6 @@ calcHeatMap <- function(mSet, signif.only,
   }
 }
 
-#' @title Get performance for multi-comparison ML model
-#' @description ROC curves can be a bit tricky for multivariate models. This evaluates each possible pair of categories to generate individual and average AUC.
-#' @param model ML model
-#' @return FPR,TPR,average AUC,AUC for a given pair, and the name of the comparison
-#' @seealso 
-#'  \code{\link[pROC]{multiclass.roc}},\code{\link[pROC]{auc}}
-#'  \code{\link[data.table]{rbindlist}}
-#' @rdname getMultiMLperformance
-#' @export 
-#' @importFrom pROC multiclass.roc auc
-#' @importFrom data.table rbindlist
-getMultiMLperformance <- function(x, type="roc"){
-  
-  try({
-    mroc = pROC::multiclass.roc(x$labels,
-                                x$prediction)
-  },silent = F)
-  # try({
-  #   mroc = pROC::multiclass.roc(x$labels, factor(x$prediction,
-  #                                                ordered = T))
-  # }, silent=F)
-  
-  data.table::rbindlist(lapply(mroc$rocs, function(roc.pair){
-    try({
-      dt = data.table(FPR = sapply(roc.pair$specificities, function(x) 1-x),
-                      TPR = roc.pair$sensitivities,
-                      AUC_AVG = as.numeric(mroc$auc),
-                      AUC_PAIR = as.numeric(pROC::auc(roc.pair)),
-                      comparison = paste0(roc.pair$levels,collapse=" vs. "))
-    },silent=T)
-    try({
-      dt = data.table(FPR = sapply(roc.pair[[1]]$specificities, function(x) 1-x),
-                      TPR = roc.pair[[1]]$sensitivities,
-                      AUC_AVG = as.numeric(mroc$auc),
-                      AUC_PAIR = as.numeric(pROC::auc(roc.pair[[1]])),
-                      comparison = paste0(roc.pair[[1]]$levels,collapse=" vs. "))  
-    },silent=T)
-    dt
-  })) 
-}
-
 #' @title Get metadata/mz column distribution
 #' @description Which columns are metadata, which are m/z values?
 #' @param csv CSV to evaluate
@@ -468,7 +427,7 @@ combatCSV <- function(mSet, tbl="norm"){
 #' @export 
 #' @importFrom stringr str_match
 #' @importFrom DT datatable
-metshiTable <- function(content, options=NULL, rownames= T){
+metshiTable <- function(content, options=NULL, rownames= T, selection = 'single'){
   opts = list(deferRender = TRUE, 
               scrollY = 200,
               searching = TRUE,
@@ -492,7 +451,7 @@ metshiTable <- function(content, options=NULL, rownames= T){
     rownames(content) <- paste0(rownames(content), sapply(rownames(content), function(mz) if(grepl("\\-", mz)) "" else "+"))
   }
   DT::datatable(content,
-                selection = 'single',
+                selection = selection,
                 class = 'compact', height = "500px",
                 extensions = c("FixedColumns", "Scroller", "Buttons"), 
                 options = opts,
@@ -559,6 +518,8 @@ getTopHits <- function(mSet, expnames, top, thresholds=c(), filter_mode="top"){
           search_name <- "ml"
         }
         
+        print(search_name)
+        
         # fetch involved mz values
         tbls <- switch(search_name,
                        ml = {
@@ -571,14 +532,19 @@ getTopHits <- function(mSet, expnames, top, thresholds=c(), filter_mode="top"){
                          }
                          data.dt = data.table::as.data.table(data$res[[which(unlist(sapply(data$res, function(x) !x$shuffled)))]]$importance, keep.rownames=T)
                          
-                         colnames(data.dt)[1:2] <- c("m/z","importance")
+                         if(ncol(importance) > 1){
+                           colnames(data.dt)[1:2] <- c("m/z","importance")
+                           
+                           data.ordered <- data.dt[order(importance, decreasing = T),]
+                           
+                           data.ordered$`m/z` <- gsub("^X","",data.ordered$`m/z`)
+                           
+                           res = list(data.frame(`m/z`=data.ordered$`m/z`,
+                                                 value=data.ordered$"importance"))
+                         }else{
+                           res = data.dt
+                         }
                          
-                         data.ordered <- data.dt[order(importance, decreasing = T),]
-                         
-                         data.ordered$`m/z` <- gsub("^X","",data.ordered$`m/z`)
-                         
-                         res = list(data.frame(`m/z`=data.ordered$`m/z`,
-                                               value=data.ordered$"importance"))
                          names(res) <- paste0(which.ml, " (", base_name, ")")
                          res
                        },
@@ -695,11 +661,15 @@ getTopHits <- function(mSet, expnames, top, thresholds=c(), filter_mode="top"){
                        },
                        featsel = {
                          decision = analysis$featsel[[1]]$finalDecision
-                         res = list(names(decision[decision != "Rejected"]))
+                         keep = decision[decision != "Rejected"]
+                         res = list(data.frame("m/z"=names(keep),
+                                               value=c(0)))
                          names(res) <- "featsel"
                          res
                        },
                        return(NULL))
+        
+        print(tbls)
         
         if(is.null(tbls)) return(NULL)
         
@@ -1199,13 +1169,36 @@ getPlots <- function(do, mSet, input, gbl, lcl, venn_yes, my_selection){
                          # PLOT #
                          ml_performance_rows = lapply(1:length(data$res), function(i){
                            res = data$res[[i]]
-                           ml_performance = getMLperformance(ml_res = res, 
-                                                             pos.class = input$ml_plot_posclass,
-                                                             x.metric = input$ml_plot_x,
-                                                             y.metric = input$ml_plot_y)
+                           if(input$ml_plot_facet %in% colnames(mSet$dataSet$covars)){
+                             test_samps = res$in_test
+                             perf_faceted <- lapply(unique(mSet$dataSet$covars[[input$ml_plot_facet]]), function(facet_var){
+                               in_facet = mSet$dataSet$covars$sample[which(mSet$dataSet$covars[[input$ml_plot_facet]] == facet_var)]
+                               in_facet_and_test_idx = rownames(res$prediction) %in% in_facet
+                               in_facet_and_test = rownames(res$prediction)[in_facet_and_test_idx]
+                               print(paste(c("In subset:",
+                                             in_facet_and_test),
+                                           collapse = ","))
+                               res_subset = res
+                               res_subset$prediction <- res_subset$prediction[in_facet_and_test,]
+                               res_subset$labels <- res_subset$labels[which(in_facet_and_test_idx)]
+                               subset_performance <- getMLperformance(ml_res = res_subset, 
+                                                                      pos.class = input$ml_plot_posclass,
+                                                                      x.metric = input$ml_plot_x,
+                                                                      y.metric = input$ml_plot_y)
+                               subset_performance$coords$Facet = facet_var
+                               subset_performance
+                             })
+                             ml_performance <- list(coords = data.table::rbindlist(lapply(perf_faceted, function(x) x$coords)),
+                                                    names = perf_faceted[[1]]$names)
+                           }else{
+                             #ml_performance = getMultiMLperformance(res$res[[1]])
+                             ml_performance = getMLperformance(ml_res = res, 
+                                                               pos.class = input$ml_plot_posclass,
+                                                               x.metric = input$ml_plot_x,
+                                                               y.metric = input$ml_plot_y) 
+                           }
                            ml_performance$coords$shuffled = c(res$shuffled)
                            ml_performance$coords$run = i
-                           plot_coords = ml_performance$coords[`Test set`=="Test"]
                            ml_performance
                          })
                          
@@ -1215,19 +1208,53 @@ getPlots <- function(do, mSet, input, gbl, lcl, venn_yes, my_selection){
                          ml_performance = list(coords = coords,
                                                names = ml_performance_rows[[1]]$names)
                          
-                         ml_roc = ggPlotCurves(ml_performance,
-                                               cf = gbl$functions$color.functions[[lcl$aes$spectrum]])
+                         if("Facet" %in% colnames(coords)){
+                           ml_facet_rocs = lapply(split(ml_performance$coords, ml_performance$coords$Facet),
+                                                  function(facet){
+                                                    ml_performance_facet = ml_performance
+                                                    ml_performance_facet$coords <- facet
+                                                    ml_roc = ggPlotCurves(ml_performance_facet,
+                                                                          cf = gbl$functions$color.functions[[lcl$aes$spectrum]])
+                                                    ml_roc = ml_roc + 
+                                                      ggplot2::ggtitle(unique(facet$Facet)) + 
+                                                      ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5))
+                                                    ml_roc + gbl$functions$plot.themes[[lcl$aes$theme]](base_size = lcl$aes$font$plot.font.size) + 
+                                                      ggplot2::theme(legend.position = if(input$legend) "right" else "none",
+                                                                     legend.key.size = unit(.5,"line"),
+                                                                     legend.title = element_text(size=15),
+                                                                     legend.text = element_text(size=12),
+                                                                     axis.line = ggplot2::element_line(colour = 'black',
+                                                                                                       size = .5),
+                                                                     plot.title = ggplot2::element_text(hjust = 0.5,
+                                                                                                        vjust = 0.1,
+                                                                                                        size=lcl$aes$font$plot.font.size * 1.2),
+                                                                     text = ggplot2::element_text(family = lcl$aes$font$family))
+                                                    
+                                                  })
+                           ml_roc = ggpubr::ggarrange(plotlist = ml_facet_rocs, common.legend = TRUE, legend="right")
+                         }else{
+                           ml_roc = ggPlotCurves(ml_performance,
+                                                 cf = gbl$functions$color.functions[[lcl$aes$spectrum]])
+                           
+                         }
                          
-                         no_shuffle_imp = data$res[[which(unlist(sapply(data$res, function(x) !x$shuffle)))]]$importance
-                         
-                         barplot_data <- ggPlotBar(data = no_shuffle_imp,
-                                                   cf = gbl$functions$color.functions[[lcl$aes$spectrum]],
-                                                   topn = input$ml_topn,
-                                                   ml_name = data$params$ml_name,
-                                                   ml_type = data$params$ml_method)
-                         
-                         ml_barplot <- barplot_data$plot
-                         lcl$tables$ml_bar <- barplot_data$mzdata
+                         if(ncol(data$res[[1]]$importance) > 1){
+                           no_shuffle_imp = data$res[[which(unlist(sapply(data$res, function(x) !x$shuffle)))]]$importance
+                           barplot_data <- ggPlotBar(data = no_shuffle_imp,
+                                                     cf = gbl$functions$color.functions[[lcl$aes$spectrum]],
+                                                     topn = input$ml_topn,
+                                                     ml_name = data$params$ml_name,
+                                                     ml_type = data$params$ml_method)
+                           
+                           ml_barplot <- barplot_data$plot
+                           lcl$tables$ml_bar <- barplot_data$mzdata 
+                         }else{
+                           data = data.frame(text = "No importance metric\navailable for this algorithm.")
+                           ml_barplot = ggplot2::ggplot(data) + ggplot2::geom_text(ggplot2::aes(label = text), x = 0.5, y = 0.5, size = 10) +
+                             ggplot2::theme(text = ggplot2::element_text(family = lcl$aes$font$family)) + ggplot2::theme_bw()
+                           
+                           lcl$tables$ml_bar = data$res[[1]]$importance
+                         }
                          
                          list(ml_roc = ml_roc, 
                               ml_bar = ml_barplot)
@@ -1791,10 +1818,10 @@ metshiProcess <- function(mSet, session, init=F, cl=0){
       
     }else if(req(mSet$metshiParams$miss_type ) == "rf"){ # random forest
       mSet$dataSet$proc <- replRF(mSet, 
-                                               parallelMode = mSet$metshiParams$rf_norm_parallelize, 
-                                               ntree = mSet$metshiParams$rf_norm_ntree,
-                                               cl = cl,
-                                               rf.method = mSet$metshiParams$rf_norm_method)
+                                  parallelMode = mSet$metshiParams$rf_norm_parallelize, 
+                                  ntree = mSet$metshiParams$rf_norm_ntree,
+                                  cl = cl,
+                                  rf.method = mSet$metshiParams$rf_norm_method)
       w.missing <- qs::qread("preproc.qs")
       rownames(mSet$dataSet$proc) <- rownames(w.missing)
       # - - - - - - - - - - - -
@@ -2143,30 +2170,12 @@ render.kegg.node.jw <- function (plot.data, cols.ts, img, same.layer = TRUE, typ
   else stop("unrecognized node type!")
 }
 
-ml_loop_wrapper <- function(mSet_loc, gbl, jobs, ml_session_cl=0){
+ml_loop_wrapper <- function(mSet_loc, gbl, jobs, 
+                            ml_session_cl=0, slurm_mode=F,
+                            jobid = "METSHI_ML", 
+                            job_time = "00:20:00"){
   
-  parallel::clusterExport(ml_session_cl, c("ml_run",
-                                           "gbl", 
-                                           "mSet_loc"),
-                          envir = environment())
-  
-  parallel::clusterEvalQ(ml_session_cl,{
-    small_mSet <- qs::qread(mSet_loc)
-  })
-  
-  pbapply::pblapply(jobs, 
-                    cl = if(length(jobs) > 1) ml_session_cl else 0, 
-                    function(settings, ml_cl){
-                      res = list()
-                      try({
-                        res = ml_run(settings = settings, 
-                                     mSet = small_mSet,
-                                     input = input,
-                                     cl = ml_cl)  
-                      })
-                      res
-                    },
-                    ml_cl = if(length(ml_queue$jobs) > 1) 0 else ml_session_cl)
+  print("deprecated")
 }
 
 assignInNamespace(x = "render.kegg.node", value = render.kegg.node.jw, ns = "pathview")

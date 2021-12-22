@@ -152,6 +152,14 @@ shiny::observe({
                    #similarly to venn diagram
                    flattened <- list(getAllHits(mSet,
                                                 input$mummi_anal))
+                   if(input$mummi_enr_method & grepl("combi", input$mummi_anal)){
+                     head(flattened)
+                     flattened[[1]]$value <- 1
+                     flattened[[1]]$significant <- F
+                     flattened[[1]] <- flattened[[1]][order(abs(flattened[[1]]$significant),decreasing = T),]
+                     flattened[[1]]$value[1:input$mummi_topn] <- 0
+                     flattened[[1]]$significant[1:input$mummi_topn] <- T
+                   }
                    
                    hasP = T#grepl("tt|aov|asca|combi|venn",input$mummi_anal)
                    setProgress(0.1)
@@ -171,13 +179,13 @@ shiny::observe({
                    tbl[, "p.value"] = if(hasP) flattened[[1]][,2] else c(0)
                    tbl[, "t.score"] = if(hasT) flattened[[1]][,3] else c(NA)
                    
-                   print("Preview of input table:")
-                   print(head(tbl))
-                   
                    if(hasP) if(all(is.na(tbl$p.value))) tbl$p.value <- c(0)
                    if(hasT) if(all(is.na(tbl$t.score))) tbl$t.score <- c(0)
                    
                    tmpfile <- tempfile()
+                   
+                   print("Preview of input table:")
+                   print(head(tbl))
                    
                    fwrite(if(hasT) tbl else tbl[,1:3], file=tmpfile)
                    
@@ -384,18 +392,61 @@ shiny::observe({
                  mSet$analSet$featsel <- list(boruta_res)
                },
                ml = {
-                 #try({
                    {
                      assign("ml_queue", shiny::isolate(shiny::reactiveValuesToList(ml_queue)), envir = .GlobalEnv)
                      assign("input", shiny::isolate(shiny::reactiveValuesToList(input)), envir = .GlobalEnv)
                      
                      # make subsetted mset for ML so it's not as huge in memory
-                     small_mSet <<- list(metshiParams=mSet$metshiParams)
-                     small_mSet$dataSet <<- mSet$dataSet[c("cls", "orig.cls", 
+                     small_mSet <- list(metshiParams=mSet$metshiParams)
+                     small_mSet$dataSet <- mSet$dataSet[c("cls", "orig.cls", 
                                                           "orig", "norm", 
                                                           "covars")]
                      
-                     resource_saver_mode = T # only make the datasets once, for example with resampling
+                     ml_queue$jobs <- ml_queue$jobs[!(names(ml_queue$jobs) %in% mSet$analSet$ml$rf)]
+                     uses.specific.mzs <- any(sapply(ml_queue$jobs, function(settings) settings$ml_specific_mzs != "no"))
+                     if(uses.specific.mzs){
+                       keep.analyses <- gsub(" \\(.*$", "", sapply(ml_queue$jobs, function(settings) settings$ml_specific_mzs))
+                       keep.analyses <- unique(keep.analyses[keep.analyses != "no"])
+                       #if("pca" %in% names(small_mSet$analSet)) keep.analyses <- unique(c("pca", keep.analyses))
+                       small_mSet$analSet <- mSet$analSet[keep.analyses]
+                       small_mSet$storage <- lapply(mSet$storage, function(store){
+                         store$analSet <- store$analSet[keep.analyses]
+                         store
+                       })
+                     }else{
+                       small_mSet$analSet <- NULL
+                       small_mSet$storage <- list()
+                     }
+                     
+                     has_slurm = Sys.getenv("SLURM_CPUS_ON_NODE") != ""
+                     use_slurm = T
+                     
+                     net_cores = input$ncores# - 1
+                     if(net_cores > 0 & ((!has_slurm | !use_slurm) | input$ml_resource_friendly)){
+                       try({
+                         parallel::stopCluster(session_cl)
+                         parallel::stopCluster(ml_session_cl)
+                       })
+                       logfile <- tempfile()
+                       print("Log file at:")
+                       print(logfile)
+                       #if(file.exists(logfile)) file.remove(logfile)
+                       ml_session_cl <- parallel::makeCluster(net_cores, outfile=logfile)#,setup_strategy = "sequential") # leave 1 core for general use and 1 core for shiny session
+                       # send specific functions/packages to other threads
+                       parallel::clusterEvalQ(ml_session_cl, {
+                         library(data.table)
+                         library(iterators)
+                         library(MetaboShiny)
+                         library(MetaDBparse)
+                       })  
+                     }else{
+                       ml_session_cl <- 0
+                     }
+                     
+                     mSet_loc <- tempfile()
+                     qs::qsave(small_mSet, mSet_loc)
+
+                     resource_saver_mode = input$ml_resource_friendly # only make the datasets once, for example with resampling
                      if(resource_saver_mode){
                        vars.require.dataset.change <- c("ml_test_subset",
                                                         "ml_train_subset",
@@ -417,12 +468,13 @@ shiny::observe({
                        unique.dataset.change.jobs = unique(rows.changes.dataset)
                        print(paste("preparing", length(unique.dataset.change.jobs), "dataset(s) for jobs"))
                        train.test.unique <- pbapply::pblapply(unique.dataset.change.jobs, 
-                                                              cl=0, # TODO: make parallel
-                                                              function(job){
+                                                              cl = 0,#ml_session_cl, # TODO: make parallel
+                                                              function(job, mSet_loc, input){
+                                                                small_mSet = qs::qread(mSet_loc)
                                                                 tr_te = ml_prep_data(settings = job, 
                                                                                      mSet = small_mSet,
                                                                                      input = input, cl=0)
-                                                              })
+                                                              }, mSet_loc = mSet_loc, input = input)
                        
                        mapper = data.table::rbindlist(lapply(1:length(rows.changes.dataset), function(i){
                          job = rows.changes.dataset[[i]]
@@ -430,55 +482,119 @@ shiny::observe({
                                              function(uniq.job) identical(job, uniq.job)))
                          data.table::data.table(ml_name = ml_queue$jobs[[i]]$ml_name, unique_data_id=jobi)
                        }))
-                       small_mSet$dataSet$for_ml <<- list(datasets = train.test.unique, 
+                       small_mSet$dataSet$for_ml <- list(datasets = train.test.unique, 
                                                          mapper = mapper)
                      }
                      
-                     uses.specific.mzs <- any(sapply(ml_queue$jobs, function(settings) settings$ml_specific_mzs != "no"))
-                     if(uses.specific.mzs){
-                       keep.analyses <- gsub(" \\(.*$", "", sapply(ml_queue$jobs, function(settings) settings$ml_specific_mzs))
-                       keep.analyses <- unique(keep.analyses[keep.analyses != "no"])
-                       #if("pca" %in% names(small_mSet$analSet)) keep.analyses <- unique(c("pca", keep.analyses))
-                       small_mSet$analSet <<- mSet$analSet[keep.analyses]
-                       small_mSet$storage <<- lapply(mSet$storage, function(store){
-                         store$analSet <- store$analSet[keep.analyses]
-                         store
+                     if(has_slurm & use_slurm){
+                       
+                       job_time = "24:00:00"
+                       
+                       print("Attempting to submit jobs through slurm!")
+                       
+                       settings_loc <- tempfile()
+                       first_job_parallel_count = if(ml_queue$jobs[[1]]$ml_label_shuffle){
+                         ml_queue$jobs[[1]]$ml_n_shufflings + 1
+                       }else{
+                         1
+                       }
+                       qs::qsave(ml_queue$jobs, file = settings_loc)
+                       
+                       pars = data.frame(i = 1:length(ml_queue$jobs),
+                                         mloc = c(mSet_loc),
+                                         sloc = c(settings_loc),
+                                         tmpdir = c(dirname(tempfile())))
+                       
+                       success = F
+                       
+                       try({
+                         fn <- normalizePath(paste0(tools::file_path_sans_ext(lcl$paths$csv_loc), 
+                                                    ".metshi"))
+                         qs::qsave(mSet, file = fn)
+                
+                         mem_gb = "50G"
+                         pars_filt = pars#[9981:10000,]
+                         jobname=paste0("METSHI_ML_",
+                                        lcl$proj_name,
+                                        "_",
+                                        gsub("file","",
+                                             basename(tempfile())))
+                         
+                         maxjobs = 500
+                         nodecount = floor(maxjobs / first_job_parallel_count)
+                         nodecount =  min(nodecount, nrow(pars_filt))
+                         
+                         batch_job <- slurm_apply_metshi(ml_slurm, 
+                                                         pars_filt,#[5000,], 
+                                                         cpus_per_node = 1,
+                                                         jobname = jobname,
+                                                         nodes = nodecount,#[1],
+                                                         global_objects = "gbl",
+                                                         slurm_options = list(time = job_time,
+                                                                              mem = mem_gb))
+                         
+                         completed = F
+                         
+                         print("Waiting on cluster to finish jobs...")
+                          
+                         jobs_ntot = length(ml_queue$jobs)
+                         
+                         pb = pbapply::startpb(max = jobs_ntot)
+                         while(!completed){
+                           Sys.sleep(5)
+                           running_jobs = list.files(paste0("_rslurm_", 
+                                                            batch_job$jobname),
+                                                     pattern = "rslurm")
+                           pbapply::setpb(pb, value = length(running_jobs))
+                           completed = slurm_job_complete(batch_job)
+                         }
+
+                         #rslurm::print_job_status(batch_job)
+                         # my ver has a progress bar
+                         print("Cluster batch job complete! Collecting results...")
+                         ml_queue_res <- get_slurm_out_jw(batch_job,
+                                                          outtype = "raw")
+                         
+                         names(ml_queue_res) <- sapply(ml_queue_res, function(x) x$params$ml_name)
+                         rslurm::cleanup_files(batch_job) #cleanup files
+                         
+                         success = T
                        })
+                       if(success){
+                         print("reloading mSet...")
+                         # load in mSet back
+                         mSet <- qs::qread(fn)
+                       }else{
+                         stop("ml failed")
+                       }
                      }else{
-                       small_mSet$analSet <<- NULL
-                       small_mSet$storage <<- list()
+                       try({
+                         parallel::clusterExport(ml_session_cl, c("ml_run",
+                                                                  "gbl", 
+                                                                  "mSet_loc"),
+                                                 envir = environment())
+                         
+                         read_in = parallel::clusterEvalQ(ml_session_cl,{
+                           small_mSet <- qs::qread(mSet_loc)
+                         })  
+                       })
+                       
+                       ml_queue_res <- pbapply::pblapply(ml_queue$jobs, 
+                                         cl = if(length(ml_queue$jobs) > 1) ml_session_cl else 0, 
+                                         function(settings, ml_cl){
+                                           data = list()
+                                           try({
+                                             data = ml_run(settings = settings, 
+                                                          mSet = small_mSet,
+                                                          input = input,
+                                                          cl = ml_cl,
+                                                          tmpdir = dirname(tempfile()), 
+                                                          use_slurm=F)  
+                                           })
+                                           data
+                                         },
+                                         ml_cl = if(length(ml_queue$jobs) > 1) 0 else ml_session_cl)
                      }
-                     
-                     try({
-                       parallel::stopCluster(session_cl)
-                       parallel::stopCluster(ml_session_cl)
-                     })
-                     
-                     net_cores = input$ncores# - 1
-                     if(net_cores > 0){
-                       logfile <- file.path(lcl$paths$work_dir, "metshiLog.txt")
-                       #if(file.exists(logfile)) file.remove(logfile)
-                       ml_session_cl <<- parallel::makeCluster(net_cores,
-                                                              outfile="")#logfile)#,setup_strategy = "sequential") # leave 1 core for general use and 1 core for shiny session
-                       # send specific functions/packages to other threads
-                       parallel::clusterEvalQ(ml_session_cl, {
-                         library(data.table)
-                         library(iterators)
-                         library(MetaboShiny)
-                         library(MetaDBparse)
-                       })  
-                     }else{
-                       ml_session_cl <<- 0
-                     }
-                     
-                     mSet_loc <- tempfile()
-                     qs::qsave(small_mSet, mSet_loc)
-                     print(ml_session_cl)
-                     
-                     ml_queue_res <- ml_loop_wrapper(mSet_loc = mSet_loc, 
-                                                     jobs = ml_queue$jobs,
-                                                     gbl=gbl,
-                                                     ml_session_cl = ml_session_cl)
                    }
                    
                    print("Done!")

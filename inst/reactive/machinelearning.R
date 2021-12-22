@@ -14,6 +14,13 @@ shiny::observeEvent(input$show_which_ml,{
   }
 },ignoreNULL = T, ignoreInit = T)
 
+shiny::observeEvent(input$ml_plot_facet, {
+  if(input$ml_plot_facet != "don't facet"){
+    plotmanager$make <- "ml"
+  }
+},ignoreNULL = T, ignoreInit = T)
+
+
 shiny::observeEvent(input$ml_batch_size_sampling, {
   if(input$ml_batch_size_sampling){
     shinyWidgets::updateRadioGroupButtons(session, 
@@ -35,45 +42,36 @@ shiny::observeEvent(input$ml_batch_size_sampling, {
     
   }
 })
-# meta = mSet$dataSet$covars
-# lbl_joined = paste0(meta$fcs, "_", meta$country)
-# split_80 = caret::createDataPartition(lbl_joined, p = 0.8)$Resample1
-# split_70 = caret::createDataPartition(lbl_joined, p = 0.7)$Resample1
-# split_60 = caret::createDataPartition(lbl_joined, p = 0.6)$Resample1
-# meta$eightysplit = meta$seventysplit = meta$sixtysplit = "min"
-# meta$eightysplit[split_80] = "maj"
-# meta$seventysplit[split_70] = "maj"
-# meta$sixtysplit[split_60] = "maj"
-#data.table::fwrite(meta, "/Users/ninte/Desktop/farms_may_21_meta.csv")
 
 shiny::observe({
   if(!is.null(input$ml_method)){
-    sel_mdl = input$ml_method
-    
-    if(sel_mdl == "glm (logistic)") sel_mdl <- "glm"
-    
-    mdl = caret::getModelInfo()[[sel_mdl]]
-    params <- mdl$parameters
-    output$ml_params <- renderUI({
-      list(
-        shiny::helpText(mdl$label),
-        shiny::hr(),
-        h2("Tuning settings"),
-        lapply(1:nrow(params), function(i){
-          row = params[i,]
-          list(
-            shiny::textInput(inputId = paste0("ml_", row$parameter),
-                             label = row$parameter,
-                             value=if(input$ml_method=="glmnet"){
-                               switch(row$parameter,
-                                      alpha = 1,
-                                      lambda = "0:1:0.01")
-                             }),
-            shiny::helpText(paste0(row$label, " (", row$class, ")."))
-          )
-        })
-      )
-    })
+    if(!input$ml_method %in% c("", " ")){
+      sel_mdl = input$ml_method
+      if(sel_mdl == "glm (logistic)") sel_mdl <- "glm"
+      
+      mdl = caret::getModelInfo()[[sel_mdl]]
+      params <- mdl$parameters
+      output$ml_params <- renderUI({
+        list(
+          shiny::helpText(mdl$label),
+          shiny::hr(),
+          h2("Tuning settings"),
+          lapply(1:nrow(params), function(i){
+            row = params[i,]
+            list(
+              shiny::textInput(inputId = paste0("ml_", row$parameter),
+                               label = row$parameter,
+                               value=if(input$ml_method=="glmnet"){
+                                 switch(row$parameter,
+                                        alpha = 1,
+                                        lambda = "0:1:0.01")
+                               }),
+              shiny::helpText(paste0(row$label, " (", row$class, ")."))
+            )
+          })
+        )
+      })
+    }
   }
 })
 
@@ -120,8 +118,8 @@ shiny::observeEvent(input$queue_ml, {
 })
 
 shiny::observeEvent(input$queue_ml_del, {
-  row = input$ml_queue_all_rows_selected
-  ml_queue$jobs = ml_queue$jobs[-row]
+  rows = input$ml_queue_all_rows_selected
+  ml_queue$jobs = ml_queue$jobs[-rows]
 })
 
 shiny::observeEvent(input$clear_ml_runs, {
@@ -137,7 +135,7 @@ shiny::observeEvent(input$clear_ml_runs, {
       br()
     ),
     btn_labels = c("No", "Yes"),
-    title = "Are you sure? This will erase all machine learning results.",
+    title = "Erase all machine learning results?",
     #showCloseButton = T,
     html = TRUE
   )
@@ -151,7 +149,6 @@ observeEvent(input$clear_ml_sure,{
 },ignoreNULL = T)
 
 shiny::observeEvent(input$ml_queue_all_rows_selected, {
-  print(input$ml_queue_all_rows_selected)
   params = ml_queue$jobs[[input$ml_queue_all_rows_selected]]
   param_dt = data.table::data.table(parameter = names(params),
                          value = params)

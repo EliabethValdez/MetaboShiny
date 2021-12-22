@@ -263,7 +263,11 @@ shiny::observe({
                                               choices = c(colnames(mSet$dataSet$covars)[!(colnames(mSet$dataSet$covars) %in% c("label", "sample", "individual"))]))
                      
                      shiny::updateSelectizeInput(session, "ml_batch_covars", 
-                                              choices = c(colnames(mSet$dataSet$covars)[!(colnames(mSet$dataSet$covars) %in% c("label", "sample", "individual"))]))
+                                              choices = c("", 
+                                                          colnames(mSet$dataSet$covars)[!(colnames(mSet$dataSet$covars) %in% c("label", "sample", "individual"))]),
+                                              selected = "")
+                     
+                      
                      # --- ML PCA ---
                      npc = nrow(mSet$dataSet$norm) - 1
                      shiny::updateSliderInput(session, "ml_keep_pcs", max = npc)
@@ -282,6 +286,17 @@ shiny::observe({
                          colnames(data$res[[1]]$prediction)
                        }
                        
+                       in_test = data$res[[1]]$in_test
+                       covars_in_test = mSet$dataSet$covars[sample %in% in_test]
+                       unique_no_samp = unique(covars_in_test[,-c("sample", "individual", "label")])
+                       keep_facets = names(apply(unique_no_samp, MARGIN = 2, function(x){
+                                             length(unique(x)) > 1 &
+                                             length(unique(x)) < nrow(unique_no_samp)
+                                           }))
+                       
+                       shiny::updateSelectizeInput(session, "ml_plot_facet", 
+                                                   choices = c("don't facet", keep_facets))
+                       
                        # try both options and check higher AUC
                        perf.per.posclass = sapply(classes, function(pos.class.test){
                          perf = getMLperformance(ml_res = data$res[[1]], 
@@ -293,10 +308,11 @@ shiny::observe({
                                        t[`Test set` == "Test"]$y)
                        })
                        pos.class <- names(which.max(perf.per.posclass))
+                       print(pos.class)
                        
                        shiny::updateSelectizeInput(session, "ml_plot_posclass", 
-                                                choices = classes, 
-                                                selected = pos.class)
+                                                   choices = classes, 
+                                                   selected = pos.class)
                        ###
                        
                        choices = c()

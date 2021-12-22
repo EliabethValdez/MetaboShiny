@@ -1,3 +1,7 @@
+# filechoose
+shinyFiles::shinyFileChoose(input, 'outlist_pos', root=gbl$paths$volumes, filetypes=c('tsv', 'csv'))
+shinyFiles::shinyFileChoose(input, 'outlist_neg', root=gbl$paths$volumes, filetypes=c('tsv', 'csv'))
+
 # create checkcmarks if database is present
 lapply(c("merge", 
          "db", 
@@ -34,14 +38,14 @@ shiny::observeEvent(input$ms_modes, {
     pickerUI = lapply(input$ms_modes, function(mode){
       char=if(mode == "pos") "+" else "-"
       shiny::column(width = eachCol,
-                    shiny::fileInput(paste0('outlist_',mode), 
-                                     gsubfn::fn$paste('Select $char peaks'), 
-                                     buttonLabel="Browse", accept = c(".csv",".tsv"))
+                    shinyFiles::shinyFilesButton(paste0('outlist_',mode),
+                                                 gsubfn::fn$paste('upload $char peaks'),
+                                                 gsubfn::fn$paste('Upload $char mode peaks'),
+                                                 FALSE)
+                    # shiny::fileInput(paste0('outlist_',mode), 
+                    #                  gsubfn::fn$paste('Select $char peaks'), 
+                    #                  buttonLabel="Browse", accept = c(".csv",".tsv"))
                     )
-      # shinyFiles::shinyFilesButton(paste0('outlist_',mode), 
-      #                              gsubfn::fn$paste('upload $char peaks'), 
-      #                              gsubfn::fn$paste('Upload $char mode peaks'), 
-      #                              FALSE)
     })
     output$outlist_pickers <- shiny::renderUI(shiny::fluidRow(align="center",pickerUI)) 
   }
@@ -112,17 +116,19 @@ shiny::observeEvent(input$checkMiss, {
     !is.null(input[[paste0("outlist_", ionMode)]])
   }))
   
-  file.pos = input$outlist_pos$datapath
-  file.neg = input$outlist_neg$datapath
+  hasPos = "pos" %in% input$ms_modes
+  hasNeg = "neg" %in% input$ms_modes
+  pospath = if(hasPos) shinyFiles::parseFilePaths(gbl$paths$volumes, input$outlist_pos)$datapath else c()
+  negpath = if(hasNeg) shinyFiles::parseFilePaths(gbl$paths$volumes, input$outlist_neg)$datapath else c()
   
   if(files.present){
-    if(!is.null(input$outlist_pos)){
-      nrows = length(vroom::vroom_lines(file.pos, altrep = TRUE, progress = TRUE)) - 1L
-      missValues$pos = getMissing(file.pos, nrow=nrows)
+    if(hasPos){
+      nrows = length(vroom::vroom_lines(pospath, altrep = TRUE, progress = TRUE)) - 1L
+      missValues$pos = getMissing(pospath, nrow=nrows)
     }
-    if(!is.null(input$outlist_neg)){
-      nrows = length(vroom::vroom_lines(file.neg, altrep = TRUE, progress = TRUE)) - 1L
-      missValues$neg = getMissing(file.neg, nrow=nrows)
+    if(hasNeg){
+      nrows = length(vroom::vroom_lines(negpath, altrep = TRUE, progress = TRUE)) - 1L
+      missValues$neg = getMissing(negpath, nrow=nrows)
     }
   }else{
     MetaboShiny::metshiAlert("Please select files first!")
@@ -189,11 +195,13 @@ shiny::observeEvent(input$create_csv,{
       # }
       
       # FOR EXAMPLE DATA: "(^\\d+?_)|POS_|NEG_"
+      pospath = if(hasPos) shinyFiles::parseFilePaths(gbl$paths$volumes, input$outlist_pos)$datapath else c()
+      negpath = if(hasNeg) shinyFiles::parseFilePaths(gbl$paths$volumes, input$outlist_neg)$datapath else c()
       
       # if loading in .csv files...
       import.pat.csvs(ppm = input$ppm,
-                      pospath = if(hasPos) input$outlist_pos$datapath else c(),
-                      negpath = if(hasNeg) input$outlist_neg$datapath else c(),
+                      pospath = if(hasPos) pospath else c(),
+                      negpath = if(hasNeg) negpath else c(),
                       metapath = input$metadata$datapath,
                       wipe.regex = input$wipe_regex,
                       missperc.mz = input$perc_limit_mz,
@@ -227,6 +235,7 @@ shiny::observeEvent(input$metadata_new_add, {
     new_meta <- data.table::fread(meta_path,fill=TRUE)#,comment.char=.)
     new_meta <- MetaboShiny::reformat.metadata(new_meta)
     colnames(new_meta) <- tolower(colnames(new_meta))
+    mSet$dataSet$covars <- plyr::join(mSet$dataSet$covars[,"sample"], new_meta, type = "left")
     mSet <- MetaboShiny::store.mSet(mSet, 
                                     proj.folder = lcl$paths$proj_dir)
     mSet <- MetaboShiny::reset.mSet(mSet,
@@ -234,11 +243,23 @@ shiny::observeEvent(input$metadata_new_add, {
                                                    paste0(lcl$proj_name,
                                                           "_ORIG.metshi")))
     mSet$dataSet$covars <- plyr::join(mSet$dataSet$covars[,"sample"], new_meta, type = "left")
+    save(mSet, file = file.path(lcl$paths$proj_dir,
+                                paste0(lcl$proj_name,"_ORIG.metshi")))
+    
+    mSet$dataSet$missing <- mSet$dataSet$orig <- mSet$dataSet$start <<- NULL
+    
     for(project in names(mSet$storage)){
       if("dataSet" %in% names(mSet$storage[[project]])){
         mSet$storage[[project]]$dataSet$covars <- plyr::join(mSet$storage[[project]]$dataSet$covars[,"sample"], 
                                                              new_meta,
                                                              type = "left")
+        project_submetshi = file.path(lcl$paths$proj_dir, paste0(project, ".metshi"))
+        subset_mSet = qs::qread(project_submetshi)
+        subset_mSet$dataSet$covars <- plyr::join(subset_mSet$dataSet$covars[,"sample"], 
+                                                 new_meta,
+                                                 type = "left")
+        qs::qsave(subset_mSet, project_submetshi)
+        subset_mSet <- NULL
         #mSet$storage[[project]]$dataSet$cls <- mSet$storage[[project]]$dataSet$orig.cls
       }
     }
@@ -246,10 +267,7 @@ shiny::observeEvent(input$metadata_new_add, {
   })
   if(success){
     mSet <<- mSet
-    # overwrite orig?
-    save(mSet, file = file.path(lcl$paths$proj_dir,
-                                paste0(lcl$proj_name,"_ORIG.metshi")))
-    mSet$dataSet$missing <- mSet$dataSet$orig <- mSet$dataSet$start <- NULL 
+    View(mSet$dataSet$covars)
     shiny::showNotification("Updated metadata!")
     filemanager$do <- "save"
     uimanager$refresh <- "general"
@@ -283,9 +301,8 @@ output$wipe_regex_ui <- shiny::renderUI({
   if(length(input$ms_modes) > 0){
     myPath = lapply(input$ms_modes, function(mode){
       inp = paste0('outlist_',mode)
-      if(!is.null(inp)){
-        path=input[[inp]]$datapath  
-      }else{
+      path=shinyFiles::parseFilePaths(gbl$paths$volumes, input$outlist_pos)$datapath
+      if(length(path) == 0){
         path=NULL
       }
       path
